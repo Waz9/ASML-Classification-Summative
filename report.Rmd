@@ -1,0 +1,362 @@
+---
+title: "Summative for classification of ASML"
+output: html_notebook
+---
+
+
+Load in the hotels dataset as a csv
+
+```{r}
+bank_loan <- readr::read_csv("https://www.louisaslett.com/Courses/MISCADA/bank_personal_loan.csv")
+```
+
+look at basic info
+```{r}
+library("skimr")
+skim(bank_loan)
+dim(bank_loan)
+```
+
+create some plots of whats going on
+```{r}
+library("tidyverse")
+library("ggplot2")
+library("GGally")
+DataExplorer::plot_histogram(bank_loan, ncol = 4)
+
+DataExplorer::plot_boxplot(bank_loan, by = "Personal.Loan", ncol = 4)
+```
+
+create a new task for this problem
+```{r}
+library("data.table")
+library("mlr3verse")
+
+bank_loan$Personal.Loan <- factor(bank_loan$Personal.Loan)
+
+set.seed(101) # set seed for reproducibility
+loan_task <- TaskClassif$new(id = "PersonalLoan",
+                               backend = bank_loan,
+                               target = "Personal.Loan",
+                               positive = "1") #getting a loan is good here
+```
+
+
+apply cross validation with 10 folds and fix them
+```{r}
+cv10 <- rsmp("cv", folds = 10)
+cv10$instantiate(loan_task)
+```
+
+
+defining the simplest learners 
+```{r}
+lrn_baseline <- lrn("classif.featureless", predict_type = "prob")
+lrn_cart     <- lrn("classif.rpart", predict_type = "prob")
+lrn_cart_cp  <- lrn("classif.rpart", predict_type = "prob", cp = 0.069, id = "cartcp") #from looking at tree bit
+lrn_ranger   <- lrn("classif.ranger", predict_type = "prob")
+lrn_xgboost  <- lrn("classif.xgboost", predict_type = "prob")
+lrn_log_reg  <- lrn("classif.log_reg", predict_type = "prob")
+```
+
+fit and use cv to assess accuracy
+```{r}
+res_baseline <- resample(loan_task, lrn_baseline, cv10, store_models = TRUE)
+res_cart <- resample(loan_task, lrn_cart, cv10, store_models = TRUE)
+res_xgboost <- resample(loan_task, lrn_xgboost, cv10, store_models = TRUE)
+
+
+res_cart_cp <- resample(loan_task, lrn_cart_cp, cv10, store_models = TRUE)
+res_ranger <- resample(loan_task, lrn_ranger, cv10, store_models = TRUE)
+res_log_reg <- resample(loan_task, lrn_log_reg, cv10, store_models = TRUE)
+```
+
+
+benchmarks for simple learners
+```{r}
+require("data.table")
+library(apcluster)
+
+#function for benchmarking
+res <- benchmark(data.table(
+  task       = list(loan_task),
+  learner    = list(lrn_baseline,
+                    lrn_cart,
+                    lrn_cart_cp,
+                    lrn_ranger,
+                    lrn_xgboost,
+                    lrn_log_reg),
+  resampling = list(cv10)
+), store_models = TRUE)
+res
+res$aggregate
+
+
+#this jsut gives the results
+res$aggregate(list(msr("classif.ce"),
+                   msr("classif.acc"),
+                   msr("classif.auc"),
+                   msr("classif.fpr"),
+                   msr("classif.fnr")))
+```
+
+
+
+
+
+TREES
+```{r}
+trees <- res$resample_result(2)
+
+#look at the tree from any CV iteration
+tree1 <- trees$learners[[10]]
+
+# This is a fitted rpart object, so we can look at the model within
+tree1_rpart <- tree1$model
+
+# If you look in the rpart package documentation, it tells us how to plot the
+# tree that was fitted
+plot(tree1_rpart, compress = TRUE, margin = 0.1, cex=2)
+text(tree1_rpart, use.n = TRUE, cex = 0.8)
+```
+
+
+look at the other tree plots from other folds of cv 
+```{r}
+plot(res$resample_result(2)$learners[[4]]$model, compress = TRUE, margin = 0.1)
+text(res$resample_result(2)$learners[[4]]$model, use.n = TRUE, cex = 0.8)
+```
+
+
+
+enable cv
+```{r}
+lrn_cart_cv <- lrn("classif.rpart", predict_type = "prob", xval = 10)
+
+res_cart_cv <- resample(loan_task, lrn_cart_cv, cv10, store_models = TRUE)
+rpart::plotcp(res_cart_cv$learners[[5]]$model)
+```
+
+
+
+choose cost penalty & add as model
+```{r}
+lrn_cart_cp <- lrn("classif.rpart", predict_type = "prob",  cp = 0.011)
+
+res <- benchmark(data.table(
+  task       = list(loan_task),
+  learner    = list(lrn_baseline,
+                    lrn_cart,
+                    lrn_cart_cp),
+  resampling = list(cv10)
+), store_models = TRUE)
+
+res$aggregate(list(msr("classif.ce"),
+                   msr("classif.acc"), 
+                   msr("classif.auc"),
+                   msr("classif.fpr"),
+                   msr("classif.fnr")))
+```
+END OF TREES
+
+
+
+data augmentation to handle missingness of values and factors
+```{r}
+# Create a pipeline which encodes and then fits an XGBoost model
+lrn_xgboost <- lrn("classif.xgboost", predict_type = "prob")
+pl_xgb <- po("encode") %>>%
+  po(lrn_xgboost)
+
+# Now fit as normal ... we can just add it to our benchmark set
+res <- benchmark(data.table(
+  task       = list(loan_task),
+  learner    = list(lrn_baseline,
+                    lrn_cart,
+                    lrn_cart_cp,
+                    pl_xgb),
+  resampling = list(cv10)
+), store_models = TRUE)
+
+res$aggregate(list(msr("classif.ce"),
+                   msr("classif.acc"),
+                   msr("classif.fpr"),
+                   msr("classif.fnr")))
+```
+
+Handling missingness is slightly more involved.  We provide a pipeline recipie here which is quite robust ... read the documentation of each step to understand more.
+
+We then apply this to logistic regression.
+
+```{r}
+# First create a pipeline of just missing fixes we can later use with models
+pl_missing <- po("fixfactors") %>>%
+  po("removeconstants") %>>%
+  po("imputesample", affect_columns = selector_type(c("ordered", "factor"))) %>>%
+  po("imputemean")
+
+# Now try with a model that needs no missingness
+lrn_log_reg <- lrn("classif.log_reg", predict_type = "prob")
+pl_log_reg <- pl_missing %>>%
+  po(lrn_log_reg)
+
+# Now fit as normal ... we can just add it to our benchmark set
+res <- benchmark(data.table(
+  task       = list(loan_task),
+  learner    = list(lrn_baseline,
+                    lrn_cart,
+                    lrn_cart_cp,
+                    pl_xgb,
+                    pl_log_reg),
+  resampling = list(cv10)
+), store_models = TRUE)
+
+res$aggregate(list(msr("classif.ce"),
+                   msr("classif.acc"),
+                   msr("classif.fpr"),
+                   msr("classif.fnr")))
+```
+
+
+
+
+try a super learner
+```{r}
+library("data.table")
+library("mlr3verse")
+
+# set seed for reproducibility
+set.seed(101) 
+
+# Load data
+bank_loan <- readr::read_csv("https://www.louisaslett.com/Courses/MISCADA/bank_personal_loan.csv")
+
+# Define task
+bank_loan$Personal.Loan <- factor(bank_loan$Personal.Loan)
+
+loan_task_sp <- TaskClassif$new(id = "PersonalLoanSuper",
+                               backend = bank_loan,
+                               target = "Personal.Loan")
+                               #positive = "1") #getting a loan is good here
+
+# Cross validation resampling strategy (with 10 folds)
+cv10 <- rsmp("cv", folds = 10)
+cv10$instantiate(loan_task_sp)
+
+# Define a collection of base learners
+lrn_baseline <- lrn("classif.featureless", predict_type = "prob")
+lrn_cart     <- lrn("classif.rpart", predict_type = "prob")
+lrn_cart_cp  <- lrn("classif.rpart", predict_type = "prob", cp = 0.069, id = "cartcp")
+lrn_ranger   <- lrn("classif.ranger", predict_type = "prob")
+lrn_xgboost  <- lrn("classif.xgboost", predict_type = "prob")
+lrn_log_reg  <- lrn("classif.log_reg", predict_type = "prob")
+
+# Define a super learner
+lrnsp_log_reg <- lrn("classif.log_reg", predict_type = "prob", id = "super")
+
+# Missingness imputation pipeline
+pl_missing <- po("fixfactors") %>>%
+  po("removeconstants") %>>%
+  po("imputesample", affect_columns = selector_type(c("ordered", "factor"))) %>>%
+  po("imputemean")
+
+# Factors coding pipeline
+pl_factor <- po("encode")
+
+# Now define the full pipeline
+spr_lrn <- gunion(list(
+  # First group of learners requiring no modification to input
+  gunion(list(
+    po("learner_cv", lrn_baseline),
+    po("learner_cv", lrn_cart),
+    po("learner_cv", lrn_cart_cp)
+  )),
+  # Next group of learners requiring special treatment of missingness
+  pl_missing %>>%
+    gunion(list(
+      po("learner_cv", lrn_ranger),
+      po("learner_cv", lrn_log_reg),
+      po("nop") # This passes through the original features adjusted for
+                # missingness to the super learner
+    )),
+  # Last group needing factor encoding
+  pl_factor %>>%
+    po("learner_cv", lrn_xgboost)
+)) %>>%
+  po("featureunion") %>>%
+  po(lrnsp_log_reg)
+
+# This plot shows a graph of the learning pipeline
+spr_lrn$plot()
+
+# Finally fit the base learners and super learner and evaluate
+res_spr <- resample(loan_task_sp, spr_lrn, cv10, store_models = TRUE)
+res_spr$aggregate(list(msr("classif.ce"),
+                       msr("classif.acc"),
+                       msr("classif.auc"),
+                       msr("classif.fpr"),
+                       msr("classif.fnr")))
+                       
+```
+
+
+
+simple graph to plot results
+```{r}
+results <- c(0.096,
+0.015,
+0.022,
+0.014,
+0.016,
+0.049,
+0.013
+)
+
+plot(results, cex=1.3, ylab="Classification Error", xlab=" ", pch=19)
+text(x=results, labels = rownames(results))
+```
+
+
+run super learner multiple times to see spread of fpr and fnr
+```{r}
+fpr_values <- vector()
+fnr_values <- vector()
+
+for (i in 1:50){
+  print(i)
+  res_spr <- resample(loan_task_sp, spr_lrn, cv10, store_models = TRUE)
+  print("done that")
+  fpr_values <- c(fpr_values, res_spr$aggregate(list(msr("classif.fpr"))))
+  fnr_values <- c(fnr_values, res_spr$aggregate(list(msr("classif.fnr"))))
+  res_spr <- vector()
+}
+
+fpr_values <- data.frame(fpr_values)
+fnr_values <- data.frame(fnr_values)
+
+fpr_values <- c(fpr_values)
+fnr_values <- c(fnr_values)
+
+fpr_values
+fnr_values
+length(fpr_values)
+length(fnr_values)
+
+fpr_values <- unlist(fpr_values)
+fnr_values <- unlist(fnr_values)
+
+
+
+#mean
+fnr_mean <- mean(fnr_values)
+fpr_mean <- mean(fpr_values)
+
+#fnr
+plot(fnr_values, pch=16, cex.axis=1.5, cex.lab=1.5, main="False Negative Rate")
+abline(h=fnr_mean, col="red", lwd=5, lty=2)
+
+#fpr
+plot(fpr_values, pch=16, cex.axis=1.5, cex.lab=1.5, main="False Positive Rate")
+abline(h=fpr_mean, col="red", lwd=5, lty=2)
+```
+
